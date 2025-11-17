@@ -18,6 +18,7 @@ DEFAULT_SWAP=0
 CTID=""
 CT_HOSTNAME="$DEFAULT_HOSTNAME"
 CT_STORAGE="$DEFAULT_STORAGE"
+CT_STORAGE_SET=0
 CT_CORES="$DEFAULT_CORES"
 CT_MEMORY="$DEFAULT_MEMORY"
 CT_DISK="$DEFAULT_DISK"
@@ -76,7 +77,7 @@ Usage: luna-proxmox-installer.sh [options]
 Options:
   -i, --ctid <id>          Explicit container ID (default: next free ID)
   -n, --hostname <name>    LXC hostname (default: luna)
-  -s, --storage <name>     Proxmox storage for rootfs (default: local-lvm)
+  -s, --storage <name>     Proxmox storage for rootfs (default: local-lvm; interactive prompt if omitted)
   -c, --cores <count>      CPU cores (default: 1)
   -m, --memory <mb>        RAM in MB (default: 128)
   -d, --disk <gb>          Root disk size in GB (default: 2)
@@ -107,6 +108,7 @@ parse_args() {
         ;;
       -s|--storage)
         CT_STORAGE="$2"
+        CT_STORAGE_SET=1
         shift 2
         ;;
       -c|--cores)
@@ -191,6 +193,100 @@ compute_default_ctid() {
   else
     echo $((last + 1))
   fi
+}
+
+resolve_storage_selection() {
+  local storages=()
+  if ! mapfile -t storages < <(pvesm status 2>/dev/null | awk 'NR>1 && $1 != "" {printf "%s|%s|%s\n", $1, $2, $3}'); then
+    die "Unable to query storage list via 'pvesm status'."
+  fi
+
+  if [[ ${#storages[@]} -eq 0 ]]; then
+    die "No Proxmox storages detected via 'pvesm status'."
+  fi
+
+  local names=()
+  local types=()
+  local states=()
+  local recommended_index=-1
+  local existing_index=-1
+  local idx=0
+  local entry name type state
+  for entry in "${storages[@]}"; do
+    IFS='|' read -r name type state <<<"$entry"
+    names+=("$name")
+    types+=("$type")
+    states+=("$state")
+    [[ "$name" == "$DEFAULT_STORAGE" ]] && recommended_index=$idx
+    [[ "$name" == "$CT_STORAGE" ]] && existing_index=$idx
+    ((idx++))
+  done
+
+  if [[ ${#names[@]} -eq 0 ]]; then
+    die "Failed to parse any storage entries from 'pvesm status'."
+  fi
+
+  if [[ $CT_STORAGE_SET -eq 1 ]]; then
+    if (( existing_index >= 0 )); then
+      return
+    fi
+    die "Specified storage '$CT_STORAGE' not present in 'pvesm status'."
+  fi
+
+  local auto_index=$recommended_index
+  if (( auto_index < 0 )); then
+    auto_index=0
+  fi
+
+  if [[ ! -t 0 || ! -t 1 || $AUTO_CONFIRM -eq 1 ]]; then
+    CT_STORAGE="${names[$auto_index]}"
+    log_info "Selected storage '$CT_STORAGE' automatically."
+    return
+  fi
+
+  printf '\nDetected Proxmox storages:\n'
+  local marker
+  for idx in "${!names[@]}"; do
+    marker=""
+    if (( idx == auto_index )); then
+      marker=" (default)"
+    fi
+    printf '  [%d] %s (%s, %s)%s\n' "$((idx + 1))" "${names[idx]}" "${types[idx]}" "${states[idx]}" "$marker"
+  done
+  printf '\n'
+
+  local prompt_default=$((auto_index + 1))
+  local choice
+  while true; do
+    read -r -p "Select storage [${prompt_default}]: " choice || die "Storage selection aborted."
+    if [[ -z "$choice" ]]; then
+      choice=$prompt_default
+    fi
+
+    if [[ "$choice" =~ ^[0-9]+$ ]]; then
+      choice=$((choice))
+      if (( choice >= 1 && choice <= ${#names[@]} )); then
+        CT_STORAGE="${names[choice-1]}"
+        break
+      fi
+    else
+      local manual=""
+      for idx in "${!names[@]}"; do
+        if [[ "${names[idx]}" == "$choice" ]]; then
+          manual="${names[idx]}"
+          break
+        fi
+      done
+      if [[ -n "$manual" ]]; then
+        CT_STORAGE="$manual"
+        break
+      fi
+    fi
+
+    printf "Invalid selection. Enter 1-%d or a storage name listed above.\n" "${#names[@]}"
+  done
+
+  printf "Selected storage: %s\n\n" "$CT_STORAGE"
 }
 
 confirm_plan() {
@@ -636,7 +732,7 @@ summarize() {
 main() {
   parse_args "$@"
   require_root
-  require_command pct pveam pveversion curl awk sed tr mktemp openssl sha1sum md5sum
+  require_command pct pveam pveversion pvesm curl awk sed tr mktemp openssl sha1sum md5sum
   assert_proxmox
   log_info "Luna installer v$SCRIPT_VERSION"
 
@@ -650,6 +746,7 @@ main() {
     CTID=$(compute_default_ctid)
   fi
 
+  resolve_storage_selection
   prompt_credentials
   validate_disk_size
   verify_webshare_credentials
